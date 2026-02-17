@@ -1,66 +1,84 @@
-
+# server.py
 import asyncio
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-from av import VideoFrame
-import numpy as np
-import cv2
+import json
 from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription
 from camera_track import CameraVideoTrack
 
+pcs = set()
 
 
-class CameraTrack(VideoStreamTrack):
-    def __init__(self):
-        super().__init__()
-        self.cap = cv2.VideoCapture(0)  # PC webcam
-
-        if not self.cap.isOpened():
-            raise RuntimeError("Cannot open camera")
-
-    async def recv(self):
-        pts, time_base = await self.next_timestamp()
-
-        ret, frame = self.cap.read()
-        if not ret:
-            await asyncio.sleep(0.03)
-            return await self.recv()
-
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        video_frame = VideoFrame.from_ndarray(frame, format="rgb24")
-        video_frame.pts = pts
-        video_frame.time_base = time_base
-        return video_frame
-
-
-async def offer(request):
-    params = await request.json()
-    offer = RTCSessionDescription(sdp=params['sdp'], type=params['type'])
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
 
     pc = RTCPeerConnection()
-    pc.addTrack(CameraTrack())
+    pcs.add(pc)
+    print("[WS] New client connected")
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                msg_type = data.get("type")
+
+                if msg_type == "offer":
+                    print("[SDP] Received offer")
+
+                    offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
+                    await pc.setRemoteDescription(offer)
+
+                    # Add camera track AFTER setRemoteDescription
+                    pc.addTrack(CameraVideoTrack())
+
+                    answer = await pc.createAnswer()
+                    await pc.setLocalDescription(answer)
+
+                    # Wait for ICE gathering to complete so candidates are in SDP
+                    while pc.iceGatheringState != "complete":
+                        await asyncio.sleep(0.05)
+
+                    print("[SDP] Sending answer (ICE complete)")
+                    await ws.send_json({
+                        "type": pc.localDescription.type,
+                        "sdp": pc.localDescription.sdp,
+                    })
+
+                else:
+                    print(f"[WS] Unknown message type: {msg_type}")
+
+            elif msg.type == web.WSMsgType.ERROR:
+                print(f"[WS] Error: {ws.exception()}")
+                break
+
+    finally:
+        print("[WS] Client disconnected")
+        await pc.close()
+        pcs.discard(pc)
+
+    return ws
 
 
-    # negotiate
-    await pc.setRemoteDescription(offer)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
+async def on_shutdown(app):
+    print("[SERVER] Shutting down, closing peer connections...")
+    coros = [pc.close() for pc in list(pcs)]
+    await asyncio.gather(*coros)
+    pcs.clear()
 
-    # wait ICE
-    while pc.iceGatheringState != 'complete':
-        await asyncio.sleep(0.1)
 
-    return web.json_response({
-        'sdp': pc.localDescription.sdp,
-        'type': pc.localDescription.type
-    })
+@web.middleware
+async def no_cache_middleware(request, handler):
+    response = await handler(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
-if __name__ == '__main__':
-    app = web.Application()
-    app.router.add_post('/offer', offer)
-    app.router.add_get('/', lambda req: web.FileResponse('static/index.html'))
-    app.router.add_static('/static/', path='static', show_index=False)
 
+app = web.Application(middlewares=[no_cache_middleware])
+app.router.add_get("/ws", websocket_handler)
+app.router.add_get("/", lambda r: web.FileResponse("static/index.html"))
+app.router.add_static("/static/", "static")
+app.on_shutdown.append(on_shutdown)
+
+if __name__ == "__main__":
+    print("[SERVER] Starting on http://0.0.0.0:8080")
     web.run_app(app, host="0.0.0.0", port=8080)
-    # #web.run_app(app, port=8080)
-
